@@ -492,6 +492,18 @@ bool bip6_init(char *ifname)
         return false;
     }
 
+    /* make socket ipv6 only to avoid conflicts with other
+     * applications/interfaces */
+    sockopt = 1;
+    status = setsockopt(
+        BIP6_Socket, IPPROTO_IPV6, IPV6_V6ONLY, &sockopt, sizeof(sockopt));
+    if (status < 0) {
+        debug_perror("BIP6: setsockopt(IPV6_V6ONLY)");
+        close(BIP6_Socket);
+        BIP6_Socket = -1;
+        return false;
+    }
+
     if (BIP6_Socket_Scope_Id > 0) {
         unsigned int idx = BIP6_Socket_Scope_Id;
         /* Explicitly set the interface for OUTGOING multicast packets */
