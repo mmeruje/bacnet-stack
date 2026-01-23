@@ -83,6 +83,9 @@ static bool Exit_Requested;
 /* debugging info */
 static bool Debug_Enabled;
 
+static void routed_src_address(
+    BACNET_ADDRESS *router_src, uint16_t snet, const BACNET_ADDRESS *src);
+
 /**
  * @brief print debug info if debug is enabled
  * @param format - printf format string
@@ -519,9 +522,13 @@ static void send_reject_message_to_network(
 /**
  * Sends a who-is-router-to-network message
  *
+ * @param snet [in] Which BACnet network port to send the message.
  * @param dnet [in] Which BACnet network we are seeking
+ * @param src [in] The routing source information, if any.
+ * @param hop_count [in] The hop count for the message.
  */
-static void send_who_is_router_to_network(uint16_t snet, uint16_t dnet)
+static void send_who_is_router_to_network(
+    uint16_t snet, uint16_t dnet, BACNET_ADDRESS *src, uint8_t hop_count)
 {
     BACNET_ADDRESS dest;
     bool data_expecting_reply = false;
@@ -533,7 +540,8 @@ static void send_who_is_router_to_network(uint16_t snet, uint16_t dnet)
     npdu_encode_npdu_network(
         &npdu_data, NETWORK_MESSAGE_WHO_IS_ROUTER_TO_NETWORK,
         data_expecting_reply, MESSAGE_PRIORITY_NORMAL);
-    pdu_len = npdu_encode_pdu(&Tx_Buffer[0], &dest, NULL, &npdu_data);
+    npdu_data.hop_count = hop_count;
+    pdu_len = npdu_encode_pdu(&Tx_Buffer[0], &dest, src, &npdu_data);
     if (dnet) {
         len = encode_unsigned16(&Tx_Buffer[pdu_len], dnet);
         pdu_len += len;
@@ -608,9 +616,14 @@ static void who_is_router_to_network_handler(
     DNET *port = NULL;
     uint16_t network = 0;
     uint16_t len = 0;
+    BACNET_ADDRESS router_src;
+    uint8_t hop_count = 0;
 
-    (void)src;
-    (void)npdu_data;
+    if (npdu_data->hop_count > 1) {
+        hop_count = npdu_data->hop_count - 1;
+    } else {
+        return;
+    }
     if (npdu) {
         if (npdu_len >= 2) {
             len += decode_unsigned16(&npdu[len], &network);
@@ -623,10 +636,12 @@ static void who_is_router_to_network_handler(
                 }
             } else {
                 /* discover the next router on the path to the network */
+                routed_src_address(&router_src, snet, src);
                 port = Router_Table_Head;
                 while (port) {
                     if (port->net != snet) {
-                        send_who_is_router_to_network(port->net, network);
+                        send_who_is_router_to_network(
+                            port->net, network, &router_src, hop_count);
                     }
                     port = port->next;
                 }
@@ -859,89 +874,91 @@ static void routed_apdu_handler(
             the originating device shall use a broadcast MAC address
             on the originating network so that all attached routers may
             receive the message and propagate it further. */
-        datalink_get_broadcast_address(&local_dest);
-        npdu->hop_count--;
-        routed_src_address(&router_src, snet, src);
-        /* encode both source and destination for broadcast */
-        npdu_len =
-            npdu_encode_pdu(&Tx_Buffer[0], &local_dest, &router_src, npdu);
-        memmove(&Tx_Buffer[npdu_len], apdu, apdu_len);
-        /* send to my other ports */
-        log_printf("Routing a BROADCAST from %u\n", (unsigned)snet);
-        port = Router_Table_Head;
-        while (port != NULL) {
-            if (port->net != snet) {
-                datalink_send_pdu(
-                    port->net, &local_dest, npdu, &Tx_Buffer[0],
-                    npdu_len + apdu_len);
+        if (npdu->hop_count > 1) {
+            datalink_get_broadcast_address(&local_dest);
+            npdu->hop_count--;
+            routed_src_address(&router_src, snet, src);
+            /* encode both source and destination for broadcast */
+            npdu_len =
+                npdu_encode_pdu(&Tx_Buffer[0], &local_dest, &router_src, npdu);
+            memmove(&Tx_Buffer[npdu_len], apdu, apdu_len);
+            /* send to my other ports */
+            log_printf("Routing a BROADCAST from %u\n", (unsigned)snet);
+            port = Router_Table_Head;
+            while (port != NULL) {
+                if (port->net != snet) {
+                    datalink_send_pdu(
+                        port->net, &local_dest, npdu, &Tx_Buffer[0],
+                        npdu_len + apdu_len);
+                }
+                port = port->next;
             }
-            port = port->next;
         }
         return;
     }
     remote_dest = *dest;
     port = dnet_find(dest->net, &remote_dest);
     if (port) {
-        if (port->net == dest->net) {
-            log_printf("Routing to Port %u\n", (unsigned)dest->net);
-            /*  Case 1: the router is directly
-                connected to the network referred to by DNET. */
-            /*  In the first case, DNET, DADR, and Hop
-                Count shall be removed from the NPCI and the message shall be
-                sent directly to the destination device with DA set equal to
-                DADR. The control octet shall be adjusted accordingly to
-                indicate only the presence of SNET and SADR. */
-            memmove(&local_dest.mac, dest->adr, MAX_MAC_LEN);
-            local_dest.mac_len = dest->len;
-            local_dest.net = 0;
-            npdu->hop_count--;
-            routed_src_address(&router_src, snet, src);
-            npdu_len =
-                npdu_encode_pdu(&Tx_Buffer[0], &local_dest, &router_src, npdu);
-            memmove(&Tx_Buffer[npdu_len], apdu, apdu_len);
-            datalink_send_pdu(
-                port->net, &local_dest, npdu, &Tx_Buffer[0],
-                npdu_len + apdu_len);
-        } else {
-            log_printf(
-                "Routing to another Router %u\n", (unsigned)remote_dest.net);
-            /*  Case 2: the message must be
-                relayed to another router for further transmission */
-            /*  In the second case, if the Hop Count is greater than zero,
-                the message shall be sent to the next router on the
-                path to the destination network.
-                If the Hop Count is zero, then the message shall be
-                discarded. */
-            npdu->hop_count--;
-            routed_src_address(&router_src, snet, src);
-            npdu_len =
-                npdu_encode_pdu(&Tx_Buffer[0], &remote_dest, &router_src, npdu);
-            memmove(&Tx_Buffer[npdu_len], apdu, apdu_len);
-            datalink_send_pdu(
-                port->net, &remote_dest, npdu, &Tx_Buffer[0],
-                npdu_len + apdu_len);
+        if (npdu->hop_count > 1) {
+            if (port->net == dest->net) {
+                if (port->net != snet) {
+                    log_printf("Routing to Port %u\n", (unsigned)dest->net);
+                    /*  Case 1: the router is directly
+                        connected to the network referred to by DNET. */
+                    /*  In the first case, DNET, DADR, and Hop
+                        Count shall be removed from the NPCI and the
+                        message shall be sent directly to the destination
+                        device with DA set equal to DADR. The control octet
+                        shall be adjusted accordingly to indicate only the
+                        presence of SNET and SADR. */
+                    memmove(&local_dest.mac, dest->adr, MAX_MAC_LEN);
+                    local_dest.mac_len = dest->len;
+                    local_dest.net = 0;
+                    npdu->hop_count--;
+                    routed_src_address(&router_src, snet, src);
+                    npdu_len = npdu_encode_pdu(
+                        &Tx_Buffer[0], &local_dest, &router_src, npdu);
+                    memmove(&Tx_Buffer[npdu_len], apdu, apdu_len);
+                    datalink_send_pdu(
+                        port->net, &local_dest, npdu, &Tx_Buffer[0],
+                        npdu_len + apdu_len);
+                }
+            } else {
+                log_printf(
+                    "Routing to another Router %u\n",
+                    (unsigned)remote_dest.net);
+                /*  Case 2: the message must be
+                    relayed to another router for further transmission */
+                /*  In the second case, if the Hop Count is greater than
+                    zero, the message shall be sent to the next router on the
+                    path to the destination network.
+                    If the Hop Count is zero, then the message shall be
+                    discarded. */
+                npdu->hop_count--;
+                routed_src_address(&router_src, snet, src);
+                npdu_len = npdu_encode_pdu(
+                    &Tx_Buffer[0], &remote_dest, &router_src, npdu);
+                memmove(&Tx_Buffer[npdu_len], apdu, apdu_len);
+                datalink_send_pdu(
+                    port->net, &remote_dest, npdu, &Tx_Buffer[0],
+                    npdu_len + apdu_len);
+            }
         }
     } else if (dest->net) {
-        log_printf("Routing to Unknown Route %u\n", (unsigned)dest->net);
-        /* Case 3: a global broadcast is required. */
-        dest->mac_len = 0;
-        npdu->hop_count--;
-        /* encode both source and destination */
-        routed_src_address(&router_src, snet, src);
-        npdu_len = npdu_encode_pdu(&Tx_Buffer[0], dest, &router_src, npdu);
-        memmove(&Tx_Buffer[npdu_len], apdu, apdu_len);
-        /* send to all other ports */
-        port = Router_Table_Head;
-        while (port != NULL) {
-            if (port->net != snet) {
-                datalink_send_pdu(
-                    port->net, dest, npdu, &Tx_Buffer[0], npdu_len + apdu_len);
+        if (npdu->hop_count > 1) {
+            log_printf("Routing to Unknown Route %u\n", (unsigned)dest->net);
+            /*  If the next router is unknown, an attempt shall be made to
+                identify it using a Who-Is-Router-To-Network message. */
+            routed_src_address(&router_src, snet, src);
+            port = Router_Table_Head;
+            while (port != NULL) {
+                if (port->net != snet) {
+                    send_who_is_router_to_network(
+                        port->net, dest->net, &router_src, npdu->hop_count - 1);
+                }
+                port = port->next;
             }
-            port = port->next;
         }
-        /*  If the next router is unknown, an attempt shall be made to
-            identify it using a Who-Is-Router-To-Network message. */
-        send_who_is_router_to_network(0, dest->net);
     }
 }
 
