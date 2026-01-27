@@ -77,6 +77,8 @@ static uint16_t BIP6_Net;
 /* buffer for receiving packets from the directly connected ports */
 static uint8_t BIP_Rx_Buffer[BIP_MPDU_MAX];
 static uint8_t BIP6_Rx_Buffer[BIP6_MPDU_MAX];
+/* track the port where the current packet was received */
+static uint16_t Current_Receive_Net;
 /* buffer for transmitting from any port */
 #define MAX(a, b) (((a) > (b)) ? (a) : (b))
 static uint8_t Tx_Buffer[MAX(BIP_MPDU_MAX, BIP6_MPDU_MAX)];
@@ -89,27 +91,58 @@ static void routed_src_address(
 /* CIRCUIT BREAKER: Duplicate Who-Is-Router-To-Network Suppression
    This section can be removed once all routers on the network are
    properly patched to prevent reflection storms. */
-#define WHO_IS_SUPPRESSION_MAX 16
+#define WHO_IS_SUPPRESSION_MAX 256
 #define WHO_IS_SUPPRESSION_SECONDS 5
 static struct {
     uint16_t net;
+    BACNET_ADDRESS src;
     time_t last_time;
 } Who_Is_Suppression_Cache[WHO_IS_SUPPRESSION_MAX];
 
-static bool who_is_suppressed(uint16_t net)
+static bool who_is_suppressed(
+    uint16_t net, const BACNET_ADDRESS *src, uint8_t *apdu, uint16_t apdu_len)
 {
     time_t current_time = time(NULL);
     int i;
     int oldest_index = 0;
     time_t oldest_time = current_time;
 
-    if (net == 0) {
-        return false;
+    /* Only suppress Search messages (Who-Is/Who-Has)
+       or Network searches (when APDU is NULL).
+       Allow I-Am, I-Have, and all other traffic. */
+    if (apdu && apdu_len > 0) {
+        uint8_t pdu_type = (uint8_t)(apdu[0] & 0xF0);
+        if (pdu_type == PDU_TYPE_UNCONFIRMED_SERVICE_REQUEST) {
+            uint8_t service = apdu[1];
+            if ((service != SERVICE_UNCONFIRMED_WHO_IS) &&
+                (service != SERVICE_UNCONFIRMED_WHO_HAS)) {
+                return false;
+            }
+        } else {
+            return false;
+        }
     }
     for (i = 0; i < WHO_IS_SUPPRESSION_MAX; i++) {
+        bool match = false;
         if (Who_Is_Suppression_Cache[i].net == net) {
+            if (src) {
+                if (bacnet_address_same(
+                        &Who_Is_Suppression_Cache[i].src, src)) {
+                    match = true;
+                }
+            } else if (
+                Who_Is_Suppression_Cache[i].src.net == 0 &&
+                Who_Is_Suppression_Cache[i].src.mac_len == 0) {
+                match = true;
+            }
+        }
+        if (match) {
             if (difftime(current_time, Who_Is_Suppression_Cache[i].last_time) <
                 WHO_IS_SUPPRESSION_SECONDS) {
+                debug_printf(
+                    "CIRCUIT BREAKER: Suppressing duplicate search for NET "
+                    "%u\n",
+                    (unsigned)net);
                 return true;
             }
             Who_Is_Suppression_Cache[i].last_time = current_time;
@@ -121,6 +154,13 @@ static bool who_is_suppressed(uint16_t net)
         }
     }
     Who_Is_Suppression_Cache[oldest_index].net = net;
+    if (src) {
+        bacnet_address_copy(&Who_Is_Suppression_Cache[oldest_index].src, src);
+    } else {
+        memset(
+            &Who_Is_Suppression_Cache[oldest_index].src, 0,
+            sizeof(BACNET_ADDRESS));
+    }
     Who_Is_Suppression_Cache[oldest_index].last_time = current_time;
 
     return false;
@@ -657,7 +697,7 @@ static void who_is_router_to_network_handler(
             } else {
                 /* discover the next router on the path to the network */
                 /* CIRCUIT BREAKER */
-                if (who_is_suppressed(network)) {
+                if (who_is_suppressed(network, src, NULL, 0)) {
                     return;
                 }
                 /* END CIRCUIT BREAKER */
@@ -883,6 +923,11 @@ static void routed_apdu_handler(
     BACNET_ADDRESS router_src;
     int npdu_len = 0;
 
+    /*  BACnet Clause 6.3.2: Local Broadcast
+        A local broadcast, indicated by a DNET of 0, is not routed. */
+    if (dest->net == 0) {
+        return;
+    }
     /* for broadcast messages no search is needed */
     if (dest->net == BACNET_BROADCAST_NETWORK) {
         /*  A global broadcast, indicated by a DNET of X'FFFF', is sent
@@ -898,6 +943,11 @@ static void routed_apdu_handler(
             on the originating network so that all attached routers may
             receive the message and propagate it further. */
         if (npdu->hop_count > 1) {
+            /* CIRCUIT BREAKER */
+            if (who_is_suppressed(dest->net, src, apdu, apdu_len)) {
+                return;
+            }
+            /* END CIRCUIT BREAKER */
             datalink_get_broadcast_address(&local_dest);
             npdu->hop_count--;
             routed_src_address(&router_src, snet, src);
@@ -947,24 +997,25 @@ static void routed_apdu_handler(
                         npdu_len + apdu_len);
                 }
             } else {
-                debug_printf(
-                    "Routing to another Router %u\n",
-                    (unsigned)remote_dest.net);
-                /*  Case 2: the message must be
-                    relayed to another router for further transmission */
-                /*  In the second case, if the Hop Count is greater than
-                    zero, the message shall be sent to the next router on the
-                    path to the destination network.
-                    If the Hop Count is zero, then the message shall be
-                    discarded. */
-                npdu->hop_count--;
-                routed_src_address(&router_src, snet, src);
-                npdu_len = npdu_encode_pdu(
-                    &Tx_Buffer[0], &remote_dest, &router_src, npdu);
-                memmove(&Tx_Buffer[npdu_len], apdu, apdu_len);
-                datalink_send_pdu(
-                    port->net, &remote_dest, npdu, &Tx_Buffer[0],
-                    npdu_len + apdu_len);
+                if (port->net != snet) {
+                    debug_printf(
+                        "Routing to another Router %u\n",
+                        (unsigned)remote_dest.net);
+                    /*  Case 2: the message must be
+                        relayed to another router for further transmission */
+                    /*  In the second case, if the Hop Count is greater than
+                        zero, the message shall be sent to the next router on
+                       the path to the destination network. If the Hop Count is
+                       zero, then the message shall be discarded. */
+                    npdu->hop_count--;
+                    routed_src_address(&router_src, snet, src);
+                    npdu_len = npdu_encode_pdu(
+                        &Tx_Buffer[0], &remote_dest, &router_src, npdu);
+                    memmove(&Tx_Buffer[npdu_len], apdu, apdu_len);
+                    datalink_send_pdu(
+                        port->net, &remote_dest, npdu, &Tx_Buffer[0],
+                        npdu_len + apdu_len);
+                }
             }
         }
     } else if (dest->net) {
@@ -973,7 +1024,7 @@ static void routed_apdu_handler(
             /*  If the next router is unknown, an attempt shall be made to
                 identify it using a Who-Is-Router-To-Network message. */
             /* CIRCUIT BREAKER */
-            if (who_is_suppressed(dest->net)) {
+            if (who_is_suppressed(dest->net, src, apdu, apdu_len)) {
                 return;
             }
             /* END CIRCUIT BREAKER */
@@ -1051,9 +1102,18 @@ static void my_routing_npdu_handler(
                     /* add a Device object and application layer */
                     if ((dest.net == 0) ||
                         (dest.net == BACNET_BROADCAST_NETWORK)) {
+                        /* CIRCUIT BREAKER */
+                        if (who_is_suppressed(
+                                dest.net, src, &pdu[apdu_offset],
+                                (uint16_t)(pdu_len - apdu_offset))) {
+                            return;
+                        }
+                        /* END CIRCUIT BREAKER */
+                        Current_Receive_Net = snet;
                         apdu_handler(
                             src, &pdu[apdu_offset],
                             (uint16_t)(pdu_len - apdu_offset));
+                        Current_Receive_Net = 0;
                     }
                 }
             } else {
