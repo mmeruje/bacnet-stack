@@ -875,6 +875,15 @@ static int createSocket(const struct sockaddr_in *sin)
         close(sock_fd);
         return status;
     }
+    /* disable multicast loopback */
+    sockopt = 0;
+    status = setsockopt(
+        sock_fd, IPPROTO_IP, IP_MULTICAST_LOOP, &sockopt, sizeof(sockopt));
+    if (status < 0) {
+        if (BIP_Debug) {
+            perror("IP_MULTICAST_LOOP: ");
+        }
+    }
     /* Bind to the proper interface to send without default gateway */
     status = setsockopt(
         sock_fd, SOL_SOCKET, SO_BINDTODEVICE, BIP_Interface_Name,

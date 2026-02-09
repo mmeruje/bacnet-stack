@@ -514,6 +514,15 @@ bool bip6_init(char *ifname)
         }
     }
 
+    /* disable multicast loopback */
+    sockopt = 0;
+    status = setsockopt(
+        BIP6_Socket, IPPROTO_IPV6, IPV6_MULTICAST_LOOP, &sockopt,
+        sizeof(sockopt));
+    if (status < 0) {
+        debug_perror("BIP6: setsockopt(IPV6_MULTICAST_LOOP)");
+    }
+
     /* Allow us to use the same socket for sending and receiving */
     /* This makes sure that the src port is correct when sending */
     sockopt = 1;

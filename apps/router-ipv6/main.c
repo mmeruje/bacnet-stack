@@ -287,8 +287,10 @@ static void port_add(uint16_t snet, const BACNET_ADDRESS *addr)
  * @param snet - router port SNET
  * @param net - net to be added
  * @param addr - address of router at the net to be added
+ *
+ * @return true if a new route was added
  */
-static void dnet_add(uint16_t snet, uint16_t net, const BACNET_ADDRESS *addr)
+static bool dnet_add(uint16_t snet, uint16_t net, const BACNET_ADDRESS *addr)
 {
     DNET *dnet = NULL;
     DNET *port = NULL;
@@ -298,12 +300,12 @@ static void dnet_add(uint16_t snet, uint16_t net, const BACNET_ADDRESS *addr)
     /* make sure NETs are not repeated */
     dnet = dnet_find(net, NULL);
     if (dnet) {
-        return;
+        return false;
     }
     /* start with the source network number table */
     port = dnet_find(snet, NULL);
     if (!port) {
-        return;
+        return false;
     }
     dnet = port->dnets;
     if (dnet == NULL) {
@@ -324,13 +326,14 @@ static void dnet_add(uint16_t snet, uint16_t net, const BACNET_ADDRESS *addr)
         while (dnet != NULL) {
             if (dnet->net == net) {
                 /* make sure NETs are not repeated */
-                return;
+                return false;
             }
             prior_dnet = dnet;
             dnet = dnet->next;
         }
         /* next DNET to add */
         dnet = (DNET *)calloc(1, sizeof(DNET));
+        assert(dnet);
         if (addr) {
             dnet->mac_len = addr->mac_len;
             for (i = 0; i < MAX_MAC_LEN; i++) {
@@ -342,6 +345,8 @@ static void dnet_add(uint16_t snet, uint16_t net, const BACNET_ADDRESS *addr)
         dnet->next = NULL;
         prior_dnet->next = dnet;
     }
+
+    return true;
 }
 
 /**
@@ -387,7 +392,7 @@ static void datalink_get_broadcast_address(BACNET_ADDRESS *dest)
  *
  * @return number of bytes sent
  */
-static int datalink_send_pdu(
+static int router_datalink_send_pdu(
     uint16_t snet,
     BACNET_ADDRESS *dest,
     BACNET_NPDU_DATA *npdu_data,
@@ -409,6 +414,26 @@ static int datalink_send_pdu(
     }
 
     return bytes_sent;
+}
+
+/**
+ * function to send a packet out the BACnet/IP and BACnet/IPv6 ports
+ *
+ * @param dest - address to where packet is sent
+ * @param npdu_data - NPCI data to control network destination
+ * @param pdu - protocol data unit to be sent
+ * @param pdu_len - number of bytes to send
+ *
+ * @return number of bytes sent
+ */
+int datalink_send_pdu(
+    BACNET_ADDRESS *dest,
+    BACNET_NPDU_DATA *npdu_data,
+    uint8_t *pdu,
+    unsigned int pdu_len)
+{
+    return router_datalink_send_pdu(
+        Current_Receive_Net, dest, npdu_data, pdu, pdu_len);
 }
 
 /**
@@ -468,7 +493,7 @@ static void send_i_am_router_to_network(uint16_t snet, uint16_t net)
         }
         debug_printf("from %u\n", snet);
     }
-    datalink_send_pdu(snet, &dest, &npdu_data, &Tx_Buffer[0], pdu_len);
+    router_datalink_send_pdu(snet, &dest, &npdu_data, &Tx_Buffer[0], pdu_len);
 }
 
 /** Sends our Routing Table, built from our DNET[] array, as an ACK.
@@ -533,7 +558,7 @@ send_initialize_routing_table_ack(uint8_t snet, const BACNET_ADDRESS *dst)
         }
     }
     /* Now send the message */
-    datalink_send_pdu(snet, &dest, &npdu_data, &Tx_Buffer[0], pdu_len);
+    router_datalink_send_pdu(snet, &dest, &npdu_data, &Tx_Buffer[0], pdu_len);
 }
 
 /**
@@ -576,7 +601,7 @@ static void send_reject_message_to_network(
         pdu_len += len;
     }
     /* Now send the message */
-    datalink_send_pdu(snet, &dest, &npdu_data, &Tx_Buffer[0], pdu_len);
+    router_datalink_send_pdu(snet, &dest, &npdu_data, &Tx_Buffer[0], pdu_len);
 }
 
 /**
@@ -607,7 +632,7 @@ static void send_who_is_router_to_network(
         pdu_len += len;
     }
     /* Now send the message to port */
-    datalink_send_pdu(snet, &dest, &npdu_data, &Tx_Buffer[0], pdu_len);
+    router_datalink_send_pdu(snet, &dest, &npdu_data, &Tx_Buffer[0], pdu_len);
 }
 
 /**
@@ -681,8 +706,11 @@ static void who_is_router_to_network_handler(
 
     if (npdu_data->hop_count > 1) {
         hop_count = npdu_data->hop_count - 1;
+    } else if (npdu_data->hop_count == 0) {
+        hop_count = HOP_COUNT_DEFAULT;
     } else {
-        return;
+        /* hop count is 1 - can't route anymore */
+        hop_count = 0;
     }
     if (npdu) {
         if (npdu_len >= 2) {
@@ -694,7 +722,7 @@ static void who_is_router_to_network_handler(
                     /* reachable not through the port this message received */
                     send_i_am_router_to_network(snet, network);
                 }
-            } else {
+            } else if (hop_count > 0) {
                 /* discover the next router on the path to the network */
                 /* CIRCUIT BREAKER */
                 if (who_is_suppressed(network, src, NULL, 0)) {
@@ -713,6 +741,22 @@ static void who_is_router_to_network_handler(
             }
         } else {
             send_i_am_router_to_network(snet, 0);
+            if (hop_count > 0) {
+                /* CIRCUIT BREAKER */
+                if (who_is_suppressed(0, src, NULL, 0)) {
+                    return;
+                }
+                /* END CIRCUIT BREAKER */
+                routed_src_address(&router_src, snet, src);
+                port = Router_Table_Head;
+                while (port) {
+                    if (port->net != snet) {
+                        send_who_is_router_to_network(
+                            port->net, 0, &router_src, hop_count);
+                    }
+                    port = port->next;
+                }
+            }
         }
     }
 }
@@ -743,6 +787,8 @@ static void network_control_handler(
     uint16_t dnet = 0;
     uint16_t len = 0;
     const char *msg_name = NULL;
+    bool updated = false;
+    DNET *dest_port = NULL;
 
     msg_name = bactext_network_layer_msg_name(npdu_data->network_message_type);
     fprintf(stderr, "Received %s\n", msg_name);
@@ -758,11 +804,22 @@ static void network_control_handler(
             while (npdu_len >= len) {
                 len = decode_unsigned16(&npdu[npdu_offset], &dnet);
                 fprintf(stderr, "%hu", dnet);
-                dnet_add(snet, dnet, src);
+                if (dnet_add(snet, dnet, src)) {
+                    updated = true;
+                }
                 npdu_len -= len;
                 npdu_offset += len;
                 if (npdu_len) {
                     fprintf(stderr, ", ");
+                }
+            }
+            if (updated) {
+                dest_port = Router_Table_Head;
+                while (dest_port) {
+                    if (dest_port->net != snet) {
+                        send_i_am_router_to_network(dest_port->net, 0);
+                    }
+                    dest_port = dest_port->next;
                 }
             }
             fprintf(stderr, ".\n");
@@ -960,7 +1017,7 @@ static void routed_apdu_handler(
             port = Router_Table_Head;
             while (port != NULL) {
                 if (port->net != snet) {
-                    datalink_send_pdu(
+                    router_datalink_send_pdu(
                         port->net, &local_dest, npdu, &Tx_Buffer[0],
                         npdu_len + apdu_len);
                 }
@@ -992,7 +1049,7 @@ static void routed_apdu_handler(
                     npdu_len = npdu_encode_pdu(
                         &Tx_Buffer[0], &local_dest, &router_src, npdu);
                     memmove(&Tx_Buffer[npdu_len], apdu, apdu_len);
-                    datalink_send_pdu(
+                    router_datalink_send_pdu(
                         port->net, &local_dest, npdu, &Tx_Buffer[0],
                         npdu_len + apdu_len);
                 }
@@ -1012,7 +1069,7 @@ static void routed_apdu_handler(
                     npdu_len = npdu_encode_pdu(
                         &Tx_Buffer[0], &remote_dest, &router_src, npdu);
                     memmove(&Tx_Buffer[npdu_len], apdu, apdu_len);
-                    datalink_send_pdu(
+                    router_datalink_send_pdu(
                         port->net, &remote_dest, npdu, &Tx_Buffer[0],
                         npdu_len + apdu_len);
                 }
@@ -1063,6 +1120,14 @@ static void my_routing_npdu_handler(
     unsigned protocol_version = 0;
     BACNET_ADDRESS dest = { 0 };
     BACNET_NPDU_DATA npdu_data = { 0 };
+    BACNET_ADDRESS my_addr = { 0 };
+
+    if (port_find(snet, &my_addr)) {
+        if (bacnet_address_same(src, &my_addr)) {
+            /* derived from our own transmit - ignore it! */
+            return;
+        }
+    }
 
     if (!pdu) {
         /* no packet */
@@ -1133,7 +1198,7 @@ static void my_routing_npdu_handler(
 /**
  * Initialize the BACnet/IPv6 and BACnet/IP data links
  */
-static void datalink_init(void)
+static void router_datalink_init(void)
 {
     char *pEnv = NULL;
     BACNET_ADDRESS my_address = { 0 };
@@ -1278,7 +1343,7 @@ int main(int argc, char *argv[])
     if (argc > 1) {
         Device_Set_Object_Instance_Number(strtol(argv[1], NULL, 0));
     }
-    datalink_init();
+    router_datalink_init();
     atexit(cleanup);
     control_c_hooks();
     /* configure the timeout values */
