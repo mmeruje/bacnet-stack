@@ -22,6 +22,30 @@
 #endif
 #include "bacport.h"
 
+/* IPV6_PKTINFO rides along as ancillary data on each datagram and records
+   the interface the packet was received on. glibc only exposes the real
+   structure when _GNU_SOURCE is defined, so mirror the layout here. */
+struct bip6_pktinfo {
+    struct in6_addr ipi6_addr;
+    unsigned int ipi6_ifindex;
+};
+
+/* On-link IPv6 prefixes of the configured BACNET_BIP6_IFACE, used to tell
+   multicast that belongs to our directly connected Thread network apart
+   from multicast that a host firewall forwarded onto our interface from
+   the ethernet side. */
+#define BIP6_PREFIX_MAX 8
+struct bip6_prefix {
+    struct in6_addr address;
+    uint8_t prefix;
+};
+static struct bip6_prefix BIP6_Prefix_List[BIP6_PREFIX_MAX];
+static uint8_t BIP6_Prefix_Count;
+static struct bip6_prefix BIP6_Extra_Prefix_List[BIP6_PREFIX_MAX];
+static uint8_t BIP6_Extra_Prefix_Count;
+/* set via BACNET_BIP6_TRUST_ALL=1 to disable source-address filtering */
+static bool BIP6_Trust_All = false;
+
 /* enable debugging */
 static bool BIP6_Debug = false;
 
@@ -71,6 +95,168 @@ static void debug_print_ipv6(const char *str, const struct in6_addr *addr)
 }
 
 /**
+ * @brief Compute the prefix length from an IPv6 netmask
+ * @param netmask - IPv6 netmask, or NULL
+ * @return prefix length in bits (0..128)
+ */
+static uint8_t bip6_prefix_length(const struct in6_addr *netmask)
+{
+    uint8_t prefix = 0;
+    unsigned int j;
+
+    if (netmask) {
+        for (j = 0; j < 16; j++) {
+            uint8_t byte = netmask->s6_addr[j];
+            while (byte) {
+                prefix++;
+                byte = (uint8_t)((byte << 1) & 0xFF);
+            }
+        }
+    }
+    return prefix;
+}
+
+/**
+ * @brief Add a prefix to the on-link (or extra) prefix list
+ * @param address - network address
+ * @param prefix - prefix length in bits
+ * @param extra - true adds to the BACNET_BIP6_PREFIXES list
+ * @return true if the prefix was added
+ */
+static bool bip6_prefix_add(
+    const struct in6_addr *address, uint8_t prefix, bool extra)
+{
+    struct bip6_prefix *list;
+    uint8_t *count;
+
+    if (extra) {
+        list = BIP6_Extra_Prefix_List;
+        count = &BIP6_Extra_Prefix_Count;
+    } else {
+        list = BIP6_Prefix_List;
+        count = &BIP6_Prefix_Count;
+    }
+    if (!address || (*count >= BIP6_PREFIX_MAX)) {
+        return false;
+    }
+    if (prefix > 128) {
+        prefix = 128;
+    }
+    memcpy(&list[*count].address, address, sizeof(struct in6_addr));
+    list[*count].prefix = prefix;
+    (*count)++;
+    return true;
+}
+
+/**
+ * @brief Check if an address is a link-local (fe80::/10) address
+ */
+static bool bip6_address_is_link_local(const struct in6_addr *address)
+{
+    return (address->s6_addr[0] == 0xFE) &&
+        ((address->s6_addr[1] & 0xC0) == 0x80);
+}
+
+/**
+ * @brief Check if an address falls inside a prefix
+ */
+static bool bip6_address_prefix_match(
+    const struct in6_addr *address,
+    const struct in6_addr *network,
+    uint8_t prefix)
+{
+    uint8_t full = prefix / 8;
+    uint8_t rem = prefix % 8;
+    unsigned int i;
+
+    if (!address || !network) {
+        return false;
+    }
+    for (i = 0; i < full; i++) {
+        if (address->s6_addr[i] != network->s6_addr[i]) {
+            return false;
+        }
+    }
+    if (rem) {
+        uint8_t mask = (uint8_t)(0xFF << (8 - rem));
+        if ((address->s6_addr[full] & mask) !=
+            (network->s6_addr[full] & mask)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * @brief Check if a multicast source address is on our Thread link
+ *  Accept link-local sources and any prefix configured for the
+ *  BACNET_BIP6_IFACE (on-link prefixes plus BACNET_BIP6_PREFIXES).
+ */
+static bool bip6_source_on_link(const struct in6_addr *source)
+{
+    uint8_t i;
+
+    if (bip6_address_is_link_local(source)) {
+        return true;
+    }
+    for (i = 0; i < BIP6_Prefix_Count; i++) {
+        if (bip6_address_prefix_match(
+                source, &BIP6_Prefix_List[i].address,
+                BIP6_Prefix_List[i].prefix)) {
+            return true;
+        }
+    }
+    for (i = 0; i < BIP6_Extra_Prefix_Count; i++) {
+        if (bip6_address_prefix_match(
+                source, &BIP6_Extra_Prefix_List[i].address,
+                BIP6_Extra_Prefix_List[i].prefix)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * @brief Parse the BACNET_BIP6_PREFIXES environment variable
+ *  A comma separated list of CIDR prefixes, e.g.
+ *  "fd1f:7f1a:f003::/64,fd00::/8"
+ */
+static void bip6_parse_prefixes(const char *str)
+{
+    char buf[512];
+    char *token;
+    char *slash;
+    unsigned long prefix;
+    BACNET_IP6_ADDRESS baddr = { 0 };
+    struct in6_addr addr = { 0 };
+    unsigned int i;
+
+    if (!str) {
+        return;
+    }
+    snprintf(buf, sizeof(buf), "%s", str);
+    token = strtok(buf, ",");
+    while (token) {
+        while ((*token == ' ') || (*token == '\t')) {
+            token++;
+        }
+        prefix = 128;
+        slash = strchr(token, '/');
+        if (slash) {
+            prefix = strtoul(slash + 1, NULL, 0);
+            *slash = '\0';
+        }
+        if (bvlc6_address_from_ascii(&baddr, token)) {
+            for (i = 0; i < IP6_ADDRESS_MAX; i++) {
+                addr.s6_addr[i] = baddr.address[i];
+            }
+            bip6_prefix_add(&addr, (uint8_t)prefix, true);
+        }
+        token = strtok(NULL, ",");
+    }
+}
+
+/**
  * @brief Enabled debug printing of BACnet/IPv6
  */
 void bip6_debug_enable(void)
@@ -107,25 +293,33 @@ void bip6_set_interface(char *ifname)
 
     while (ifa_tmp) {
         if ((ifa_tmp->ifa_addr) && (ifa_tmp->ifa_addr->sa_family == AF_INET6)) {
-            debug_fprintf_bip6(
-                stdout, "BIP6: found interface: %s\n", ifa_tmp->ifa_name);
-        }
-        if ((ifa_tmp->ifa_addr) && (ifa_tmp->ifa_addr->sa_family == AF_INET6) &&
-            (bacnet_stricmp(ifa_tmp->ifa_name, ifname) == 0)) {
-            sin = (struct sockaddr_in6 *)ifa_tmp->ifa_addr;
-            bvlc6_address_set(
-                &BIP6_Addr, ntohs(sin->sin6_addr.s6_addr16[0]),
-                ntohs(sin->sin6_addr.s6_addr16[1]),
-                ntohs(sin->sin6_addr.s6_addr16[2]),
-                ntohs(sin->sin6_addr.s6_addr16[3]),
-                ntohs(sin->sin6_addr.s6_addr16[4]),
-                ntohs(sin->sin6_addr.s6_addr16[5]),
-                ntohs(sin->sin6_addr.s6_addr16[6]),
-                ntohs(sin->sin6_addr.s6_addr16[7]));
-            debug_print_ipv6(ifname, (&sin->sin6_addr));
-            found = true;
-            BIP6_Socket_Scope_Id = if_nametoindex(ifname);
-            break;
+            if (bacnet_stricmp(ifa_tmp->ifa_name, ifname) == 0) {
+                sin = (struct sockaddr_in6 *)ifa_tmp->ifa_addr;
+                if (!found) {
+                    bvlc6_address_set(
+                        &BIP6_Addr, ntohs(sin->sin6_addr.s6_addr16[0]),
+                        ntohs(sin->sin6_addr.s6_addr16[1]),
+                        ntohs(sin->sin6_addr.s6_addr16[2]),
+                        ntohs(sin->sin6_addr.s6_addr16[3]),
+                        ntohs(sin->sin6_addr.s6_addr16[4]),
+                        ntohs(sin->sin6_addr.s6_addr16[5]),
+                        ntohs(sin->sin6_addr.s6_addr16[6]),
+                        ntohs(sin->sin6_addr.s6_addr16[7]));
+                    debug_print_ipv6(ifname, (&sin->sin6_addr));
+                    found = true;
+                    BIP6_Socket_Scope_Id = if_nametoindex(ifname);
+                }
+                /* record the on-link prefix for this address so multicast
+                   source filtering can accept our own Thread side */
+                if (ifa_tmp->ifa_netmask &&
+                    (ifa_tmp->ifa_netmask->sa_family == AF_INET6)) {
+                    struct sockaddr_in6 *sn =
+                        (struct sockaddr_in6 *)ifa_tmp->ifa_netmask;
+                    bip6_prefix_add(
+                        &sin->sin6_addr,
+                        bip6_prefix_length(&sn->sin6_addr), false);
+                }
+            }
         }
         ifa_tmp = ifa_tmp->ifa_next;
     }
@@ -314,6 +508,17 @@ uint16_t bip6_receive(
     int received_bytes = 0;
     int offset = 0;
     uint16_t i = 0;
+    struct iovec iov = { 0 };
+    struct msghdr msgh = { 0 };
+    struct cmsghdr *cmsg = NULL;
+    struct bip6_pktinfo *pktinfo = NULL;
+    unsigned int ifindex = 0;
+    /* buffer for the IPV6_PKTINFO ancillary data that records
+       which interface the datagram arrived on */
+    union {
+        struct cmsghdr hdr;
+        uint8_t data[CMSG_SPACE(sizeof(struct bip6_pktinfo))];
+    } controle = { { 0 } };
 
     /* Make sure the socket is open */
     if (BIP6_Socket < 0) {
@@ -335,9 +540,15 @@ uint16_t bip6_receive(
     max = BIP6_Socket;
     /* see if there is a packet for us */
     if (select(max + 1, &read_fds, NULL, NULL, &select_timeout) > 0) {
-        received_bytes = recvfrom(
-            BIP6_Socket, (char *)&npdu[0], max_npdu, 0, (struct sockaddr *)&sin,
-            &sin_len);
+        iov.iov_base = &npdu[0];
+        iov.iov_len = max_npdu;
+        msgh.msg_name = &sin;
+        msgh.msg_namelen = sin_len;
+        msgh.msg_iov = &iov;
+        msgh.msg_iovlen = 1;
+        msgh.msg_control = &controle;
+        msgh.msg_controllen = sizeof(controle);
+        received_bytes = recvmsg(BIP6_Socket, &msgh, 0);
     } else {
         return 0;
     }
@@ -348,6 +559,45 @@ uint16_t bip6_receive(
     /* no problem, just no bytes */
     if (received_bytes == 0) {
         return 0;
+    }
+    /* Only accept IPv6 multicast that belongs to our directly connected
+       Thread network.  If the host forwards multicast between interfaces
+       (e.g. an OpenWrt firewall routing IPv6 between the ethernet and the
+       Thread interface), multicast from sibling Thread networks is
+       delivered with an egress interface that matches our own, so the
+       datagram's source address is the reliable discriminator: it must be
+       reachable on our own link. */
+    if (BIP6_Socket_Scope_Id > 0) {
+        ifindex = 0;
+        for (cmsg = CMSG_FIRSTHDR(&msgh); cmsg != NULL;
+             cmsg = CMSG_NXTHDR(&msgh, cmsg)) {
+            if ((cmsg->cmsg_level == IPPROTO_IPV6) &&
+                (cmsg->cmsg_type == IPV6_PKTINFO)) {
+                pktinfo = (struct bip6_pktinfo *)(void *)CMSG_DATA(cmsg);
+                ifindex = pktinfo->ipi6_ifindex;
+                break;
+            }
+        }
+        if ((ifindex != 0) &&
+            (ifindex != (unsigned int)BIP6_Socket_Scope_Id)) {
+            debug_fprintf_bip6(
+                stdout,
+                "BIP6: dropped packet from interface %u (expected %u)\n",
+                (unsigned)ifindex, (unsigned)BIP6_Socket_Scope_Id);
+            return 0;
+        }
+        /* multicast destination packets must originate from our Thread side */
+        if (pktinfo && (BIP6_Trust_All == false)) {
+            if ((pktinfo->ipi6_addr.s6_addr[0] & 0xFF) == 0xFF) {
+                if (!bip6_source_on_link(&sin.sin6_addr)) {
+                    debug_fprintf_bip6(
+                        stdout, "BIP6: dropped foreign multicast\n");
+                    debug_print_ipv6("src", &sin.sin6_addr);
+                    debug_print_ipv6("dst", &pktinfo->ipi6_addr);
+                    return 0;
+                }
+            }
+        }
     }
     /* the signature of a BACnet/IPv6 packet */
     if (npdu[0] != BVLL_TYPE_BACNET_IP6) {
@@ -470,11 +720,24 @@ bool bip6_init(char *ifname)
     int status = 0; /* return from socket lib calls */
     struct sockaddr_in6 server = { 0 };
     int sockopt = 0;
+    char *pEnv = NULL;
 
     if (ifname) {
         bip6_set_interface(ifname);
     } else {
         bip6_set_interface("eth0");
+    }
+    /* allow the user to disable multicast source filtering or to add
+       extra prefixes that belong to the directly connected Thread network */
+    pEnv = getenv("BACNET_BIP6_TRUST_ALL");
+    if (pEnv) {
+        if (strtol(pEnv, NULL, 0) != 0) {
+            BIP6_Trust_All = true;
+        }
+    }
+    pEnv = getenv("BACNET_BIP6_PREFIXES");
+    if (pEnv) {
+        bip6_parse_prefixes(pEnv);
     }
     if (BIP6_Addr.port == 0) {
         bip6_set_port(0xBAC0U);
@@ -521,6 +784,16 @@ bool bip6_init(char *ifname)
         sizeof(sockopt));
     if (status < 0) {
         debug_perror("BIP6: setsockopt(IPV6_MULTICAST_LOOP)");
+    }
+
+    /* request IPV6_PKTINFO so we can see which interface each received
+     * datagram actually arrived on, and drop multicast that was forwarded
+     * onto the ethernet interface instead of our Thread interface */
+    sockopt = 1;
+    status = setsockopt(
+        BIP6_Socket, IPPROTO_IPV6, IPV6_RECVPKTINFO, &sockopt, sizeof(sockopt));
+    if (status < 0) {
+        debug_perror("BIP6: setsockopt(IPV6_RECVPKTINFO)");
     }
 
     /* Allow us to use the same socket for sending and receiving */

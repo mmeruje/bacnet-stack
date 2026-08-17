@@ -167,6 +167,68 @@ static bool who_is_suppressed(
 }
 /* END CIRCUIT BREAKER */
 
+/* Broadcast relay hold-down: when the host forwards multicast between the
+   ethernet and the Thread interface (e.g. an OpenWrt firewall routing
+   IPv6), one broadcast may be delivered - and so relayed - more than once.
+   Suppress identical relays within a short window so the other port sees
+   each broadcast only once. */
+#define BROADCAST_HOLD_DOWN_MAX 64
+#define BROADCAST_HOLD_DOWN_SECONDS 2
+static struct {
+    BACNET_ADDRESS src;
+    uint16_t dest_net;
+    uint32_t hash;
+    time_t last_time;
+} Broadcast_Hold_Down_Cache[BROADCAST_HOLD_DOWN_MAX];
+
+static uint32_t apdu_hash(const uint8_t *apdu, uint16_t apdu_len)
+{
+    uint32_t hash = 0;
+    uint16_t i = 0;
+
+    if (apdu) {
+        for (i = 0; i < apdu_len; i++) {
+            hash = (hash * 33) + apdu[i];
+        }
+    }
+    return hash;
+}
+
+static bool broadcast_hold_down(
+    uint16_t dest_net,
+    const BACNET_ADDRESS *src,
+    const uint8_t *apdu,
+    uint16_t apdu_len)
+{
+    uint32_t hash = apdu_hash(apdu, apdu_len);
+    time_t current_time = time(NULL);
+    int i = 0;
+    int oldest_index = 0;
+    time_t oldest_time = current_time;
+
+    for (i = 0; i < BROADCAST_HOLD_DOWN_MAX; i++) {
+        if ((Broadcast_Hold_Down_Cache[i].dest_net == dest_net) &&
+            (Broadcast_Hold_Down_Cache[i].hash == hash) &&
+            (bacnet_address_same(&Broadcast_Hold_Down_Cache[i].src, src))) {
+            if (difftime(current_time, Broadcast_Hold_Down_Cache[i].last_time) <
+                BROADCAST_HOLD_DOWN_SECONDS) {
+                return true;
+            }
+            Broadcast_Hold_Down_Cache[i].last_time = current_time;
+            return false;
+        }
+        if (Broadcast_Hold_Down_Cache[i].last_time < oldest_time) {
+            oldest_time = Broadcast_Hold_Down_Cache[i].last_time;
+            oldest_index = i;
+        }
+    }
+    bacnet_address_copy(&Broadcast_Hold_Down_Cache[oldest_index].src, src);
+    Broadcast_Hold_Down_Cache[oldest_index].dest_net = dest_net;
+    Broadcast_Hold_Down_Cache[oldest_index].hash = hash;
+    Broadcast_Hold_Down_Cache[oldest_index].last_time = current_time;
+    return false;
+}
+
 /**
  * Search the router table to find a matching DNET entry
  *
@@ -184,11 +246,17 @@ static DNET *dnet_find(uint16_t net, BACNET_ADDRESS *addr)
     DNET *dnet = NULL;
     unsigned int i = 0;
 
+    /* directly connected networks have priority over learned routes */
     while (port != NULL) {
         if (net == port->net) {
             /* DNET is directly connected to the router */
             return port;
-        } else if (port->dnets) {
+        }
+        port = port->next;
+    }
+    port = Router_Table_Head;
+    while (port != NULL) {
+        if (port->dnets) {
             /* search router ports DNET list */
             dnet = port->dnets;
             while (dnet != NULL) {
@@ -300,6 +368,10 @@ static bool dnet_add(uint16_t snet, uint16_t net, const BACNET_ADDRESS *addr)
     /* make sure NETs are not repeated */
     dnet = dnet_find(net, NULL);
     if (dnet) {
+        return false;
+    }
+    /* a directly connected network can't be learned through another port */
+    if (port_find(net, NULL)) {
         return false;
     }
     /* start with the source network number table */
@@ -927,8 +999,16 @@ static void routed_src_address(
         /* copy our directly connected port address */
         if (port_find(snet, router_src)) {
             if (src->net) {
-                /* from a router - add router our table */
-                dnet_add(snet, src->net, src);
+                if (port_find(src->net, NULL)) {
+                    /* The origin network is one of our directly connected
+                       networks.  It is not reachable through another one of
+                       our ports, so we must not record a cross-port route
+                       for it - that would make traffic from the IPv4 side
+                       look like it came from our Thread (or vice versa). */
+                } else {
+                    /* from a router - add router our table */
+                    dnet_add(snet, src->net, src);
+                }
                 /* the routed address stays the same */
                 router_src->net = src->net;
                 router_src->len = src->len;
@@ -1005,6 +1085,11 @@ static void routed_apdu_handler(
                 return;
             }
             /* END CIRCUIT BREAKER */
+            /* suppress duplicate relays caused by the host forwarding the
+               same multicast onto more than one of our interfaces */
+            if (broadcast_hold_down(dest->net, src, apdu, apdu_len)) {
+                return;
+            }
             datalink_get_broadcast_address(&local_dest);
             npdu->hop_count--;
             routed_src_address(&router_src, snet, src);
@@ -1017,6 +1102,15 @@ static void routed_apdu_handler(
             port = Router_Table_Head;
             while (port != NULL) {
                 if (port->net != snet) {
+                    /*  BACnet Clause 6.3.2: a router shall broadcast the
+                        message on all directly connected networks except
+                        the network of origin.  If the SNET identifies one of
+                        our own directly connected networks, don't re-enter
+                        it - that is where the message came from. */
+                    if (src->net && (port->net == src->net)) {
+                        port = port->next;
+                        continue;
+                    }
                     router_datalink_send_pdu(
                         port->net, &local_dest, npdu, &Tx_Buffer[0],
                         npdu_len + apdu_len);
@@ -1224,6 +1318,7 @@ static void router_datalink_init(void)
     }
     atexit(bip_cleanup);
     /* BACnet/IPv6 Initialization */
+    bip6_debug_enable();
     pEnv = getenv("BACNET_BIP6_PORT");
     if (pEnv) {
         bip6_set_port((uint16_t)strtol(pEnv, NULL, 0));
